@@ -1,0 +1,15 @@
+node_modules/
+playground/
+.DS_Store
+coverage/
+coverage.html
+/src/opentype/shapers/generated/
+/index.js
+/base.js
+*.js.map
+.nyc_output
+dist
+.parcel-cache
+.env
+.env.*
+preview/out.svg

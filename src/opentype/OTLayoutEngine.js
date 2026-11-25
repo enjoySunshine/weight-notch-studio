@@ -1,0 +1,150 @@
+import ShapingPlan from './ShapingPlan';
+import * as Shapers from './shapers';
+import GlyphInfo from './GlyphInfo';
+import GSUBProcessor from './GSUBProcessor';
+import GPOSProcessor from './GPOSProcessor';
+
+export default class OTLayoutEngine {
+  constructor(font) {
+    this.font = font;
+    this.glyphInfos = null;
+    this.plan = null;
+    this.GSUBProcessor = null;
+    this.GPOSProcessor = null;
+    this.fallbackPosition = true;
+
+    if (font.GSUB) {
+      this.GSUBProcessor = new GSUBProcessor(font, font.GSUB);
+    }
+
+    if (font.GPOS) {
+      this.GPOSProcessor = new GPOSProcessor(font, font.GPOS);
+    }
+  }
+
+  setup(glyphRun) {
+    // Map glyphs to GlyphInfo objects so data can be passed between
+    // GSUB and GPOS without mutating the real (shared) Glyph objects.
+    this.glyphInfos = glyphRun.glyphs.map(
+      (glyph) => new GlyphInfo(this.font, glyph.id, [...glyph.codePoints]),
+    );
+
+    // Select a script based on what is available in GSUB/GPOS.
+    let script = null;
+    if (this.GPOSProcessor) {
+      script = this.GPOSProcessor.selectScript(
+        glyphRun.script,
+        glyphRun.language,
+        glyphRun.direction,
+      );
+    }
+
+    if (this.GSUBProcessor) {
+      script = this.GSUBProcessor.selectScript(
+        glyphRun.script,
+        glyphRun.language,
+        glyphRun.direction,
+      );
+    }
+
+    // Choose a shaper based on the script, and setup a shaping plan.
+    // This determines which features to apply to which glyphs. Fall back
+    // to the buffer's Unicode script when neither GSUB nor GPOS picked an
+    // OT script — script-specific shaping (e.g. Thai SARA AM decomp, the
+    // PUA fallback for fonts without Thai GSUB) still applies.
+    let shaperScript = script || glyphRun.script;
+    this.shaper = Shapers.choose(shaperScript);
+    this.plan = new ShapingPlan(this.font, shaperScript, glyphRun.direction);
+    this.shaper.plan(this.plan, this.glyphInfos, glyphRun.features);
+
+    // Build the output features object: every shaper-chosen feature marked
+    // `true`, then overlay the user's original values so alternateNumber
+    // selections (e.g. `nalt: 2` for Type 3 lookups) survive instead of being
+    // clobbered to `true`. The caller's input object is left untouched.
+    glyphRun.features = {
+      ...Object.fromEntries(
+        Object.keys(this.plan.allFeatures).map((k) => [k, true]),
+      ),
+      ...glyphRun.features,
+    };
+  }
+
+  substitute(glyphRun) {
+    if (this.GSUBProcessor) {
+      this.GSUBProcessor.resetLimits(this.glyphInfos.length);
+      this.plan.process(this.GSUBProcessor, this.glyphInfos);
+    }
+
+    // Shaper normalization can change glyphs even without a GSUB table.
+    // Keep the output glyphs and the positions allocated from them in sync.
+    glyphRun.glyphs = this.glyphInfos.map((glyphInfo) =>
+      this.font.getGlyph(glyphInfo.id, glyphInfo.codePoints),
+    );
+    // The glyphs are shared, so expose the per-run features separately.
+    glyphRun.glyphInfos = this.glyphInfos;
+  }
+
+  position(glyphRun) {
+    if (this.shaper.zeroMarkWidths === 'BEFORE_GPOS') {
+      this.zeroMarkAdvances(glyphRun.positions);
+    }
+
+    if (this.GPOSProcessor) {
+      this.plan.process(
+        this.GPOSProcessor,
+        this.glyphInfos,
+        glyphRun.positions,
+      );
+    }
+
+    if (this.shaper.zeroMarkWidths === 'AFTER_GPOS') {
+      this.zeroMarkAdvances(glyphRun.positions);
+    }
+
+    // Like HarfBuzz, resolve attachments once all advances are final, so they
+    // don't count the advances of marks zeroed after GPOS:
+    if (this.GPOSProcessor) {
+      this.GPOSProcessor.fixAttachments(this.glyphInfos, glyphRun.positions);
+    }
+
+    // Reverse the glyphs and positions if the script is right-to-left
+    if (glyphRun.direction === 'rtl') {
+      glyphRun.glyphs.reverse();
+      glyphRun.positions.reverse();
+      glyphRun.glyphInfos.reverse();
+    }
+
+    return this.GPOSProcessor && this.GPOSProcessor.features;
+  }
+
+  zeroMarkAdvances(positions) {
+    for (let i = 0; i < this.glyphInfos.length; i++) {
+      if (this.glyphInfos[i].isMark) {
+        positions[i].xAdvance = 0;
+        positions[i].yAdvance = 0;
+      }
+    }
+  }
+
+  cleanup() {
+    this.glyphInfos = null;
+    this.plan = null;
+    this.shaper = null;
+  }
+
+  getAvailableFeatures(script, language) {
+    let features = [];
+
+    if (this.GSUBProcessor) {
+      this.GSUBProcessor.selectScript(script, language);
+      features.push(...Object.keys(this.GSUBProcessor.features));
+    }
+
+    if (this.GPOSProcessor) {
+      this.GPOSProcessor.selectScript(script, language);
+      features.push(...Object.keys(this.GPOSProcessor.features));
+    }
+
+    return features;
+  }
+}

@@ -1,0 +1,272 @@
+import OTProcessor from './OTProcessor';
+import GlyphInfo from './GlyphInfo';
+
+// Limit on the length of a glyph run, as in HarfBuzz, so that malicious
+// fonts can't grow it without bound with multiple substitutions.
+const MAX_LEN_FACTOR = 256;
+const MAX_LEN_MIN = 65536;
+
+export default class GSUBProcessor extends OTProcessor {
+  maxLength = Infinity;
+
+  // Sets the length limit for a glyph run that starts with the given number of glyphs
+  resetLimits(length) {
+    this.maxLength = Math.max(length * MAX_LEN_FACTOR, MAX_LEN_MIN);
+  }
+
+  // Reverse Chaining Contextual Single Substitution is applied right-to-left,
+  // so substitutions never feed back into the lookahead context of an
+  // earlier-in-text glyph
+  isReverseLookup(lookup) {
+    return lookup.lookupType === 8;
+  }
+
+  applyLookup(lookupType, table) {
+    switch (lookupType) {
+      case 1: {
+        // Single Substitution
+        let index = this.coverageIndex(table.coverage);
+        if (index === -1) {
+          return false;
+        }
+
+        let glyph = this.glyphIterator.cur;
+        switch (table.version) {
+          case 1:
+            glyph.id = (glyph.id + table.deltaGlyphID) & 0xffff;
+            break;
+
+          case 2:
+            glyph.id = table.substitute.get(index);
+            break;
+        }
+
+        return true;
+      }
+
+      case 2: {
+        // Multiple Substitution
+        let index = this.coverageIndex(table.coverage);
+        if (index !== -1) {
+          let sequence = table.sequences.get(index);
+          if (this.glyphs.length + sequence.length - 1 > this.maxLength) {
+            return false;
+          }
+
+          if (sequence.length === 0) {
+            // If the sequence length is zero, delete the glyph.
+            // The OpenType spec disallows this, but seems like Harfbuzz and Uniscribe allow it.
+            this.glyphs.splice(this.glyphIterator.index, 1);
+
+            // Continue with the glyph that followed the deleted one
+            this.glyphIterator.index--;
+            return true;
+          }
+
+          this.glyphIterator.cur.id = sequence[0];
+          this.glyphIterator.cur.ligatureComponent = 0;
+
+          let features = this.glyphIterator.cur.features;
+          let curGlyph = this.glyphIterator.cur;
+          let replacement = sequence.slice(1).map((gid, i) => {
+            let glyph = new GlyphInfo(this.font, gid, undefined, features);
+            glyph.shaperInfo = curGlyph.shaperInfo;
+            glyph.isLigated = curGlyph.isLigated;
+            glyph.ligatureComponent = i + 1;
+            glyph.substituted = true;
+            glyph.isMultiplied = true;
+            return glyph;
+          });
+
+          this.glyphs.splice(this.glyphIterator.index + 1, 0, ...replacement);
+
+          // Continue after the inserted glyphs, so this lookup is not applied to its own output
+          this.glyphIterator.index += replacement.length;
+          return true;
+        }
+
+        return false;
+      }
+
+      case 3: {
+        // Alternate Substitution
+        let index = this.coverageIndex(table.coverage);
+        if (index !== -1) {
+          // Honour the user's 1-based alternate index for the current feature
+          // (e.g. `nalt: 2` selects the second alternate). Fall back to the
+          // first alternate when no value was given or the value isn't a
+          // positive integer.
+          let alt = this.userFeatures && this.userFeatures[this.currentFeature];
+          let userIndex = Number.isInteger(alt) && alt > 0 ? alt - 1 : 0;
+          let alternates = table.alternateSet.get(index);
+          if (userIndex >= alternates.length) {
+            userIndex = 0;
+          }
+          this.glyphIterator.cur.id = alternates[userIndex];
+          return true;
+        }
+
+        return false;
+      }
+
+      case 4: {
+        // Ligature Substitution
+        let index = this.coverageIndex(table.coverage);
+        if (index === -1) {
+          return false;
+        }
+
+        for (let ligature of table.ligatureSets.get(index)) {
+          let matched = this.sequenceMatchIndices(1, ligature.components);
+          if (!matched) {
+            continue;
+          }
+
+          let curGlyph = this.glyphIterator.cur;
+
+          // Concatenate all of the characters the new ligature will represent
+          let characters = curGlyph.codePoints.slice();
+          for (let index of matched) {
+            characters.push(...this.glyphs[index].codePoints);
+          }
+
+          // Create the replacement ligature glyph
+          let ligatureGlyph = new GlyphInfo(
+            this.font,
+            ligature.glyph,
+            characters,
+            curGlyph.features,
+          );
+          ligatureGlyph.shaperInfo = curGlyph.shaperInfo;
+          ligatureGlyph.isLigated = true;
+          ligatureGlyph.substituted = true;
+
+          // From Harfbuzz:
+          // - If it *is* a mark ligature, we don't allocate a new ligature id, and leave
+          //   the ligature to keep its old ligature id.  This will allow it to attach to
+          //   a base ligature in GPOS.  Eg. if the sequence is: LAM,LAM,SHADDA,FATHA,HEH,
+          //   and LAM,LAM,HEH for a ligature, they will leave SHADDA and FATHA with a
+          //   ligature id and component value of 2.  Then if SHADDA,FATHA form a ligature
+          //   later, we don't want them to lose their ligature id/component, otherwise
+          //   GPOS will fail to correctly position the mark ligature on top of the
+          //   LAM,LAM,HEH ligature. See https://bugzilla.gnome.org/show_bug.cgi?id=676343
+          //
+          // - If a ligature is formed of components that some of which are also ligatures
+          //   themselves, and those ligature components had marks attached to *their*
+          //   components, we have to attach the marks to the new ligature component
+          //   positions!  Now *that*'s tricky!  And these marks may be following the
+          //   last component of the whole sequence, so we should loop forward looking
+          //   for them and update them.
+          //
+          //   Eg. the sequence is LAM,LAM,SHADDA,FATHA,HEH, and the font first forms a
+          //   'calt' ligature of LAM,HEH, leaving the SHADDA and FATHA with a ligature
+          //   id and component == 1.  Now, during 'liga', the LAM and the LAM-HEH ligature
+          //   form a LAM-LAM-HEH ligature.  We need to reassign the SHADDA and FATHA to
+          //   the new ligature with a component value of 2.
+          //
+          //   This in fact happened to a font...  See https://bugzilla.gnome.org/show_bug.cgi?id=437633
+          let isMarkLigature = curGlyph.isMark;
+          for (let i = 0; i < matched.length && isMarkLigature; i++) {
+            isMarkLigature = this.glyphs[matched[i]].isMark;
+          }
+
+          ligatureGlyph.ligatureID = isMarkLigature ? null : this.ligatureID++;
+
+          let lastLigID = curGlyph.ligatureID;
+          let lastNumComps = curGlyph.codePoints.length;
+          let curComps = lastNumComps;
+          let idx = this.glyphIterator.index + 1;
+
+          // Set ligatureID and ligatureComponent on glyphs that were skipped in the matched sequence.
+          // This allows GPOS to attach marks to the correct ligature components.
+          for (let matchIndex of matched) {
+            // Don't assign new ligature components for mark ligatures (see above)
+            if (isMarkLigature) {
+              idx = matchIndex;
+            } else {
+              while (idx < matchIndex) {
+                var ligatureComponent =
+                  curComps -
+                  lastNumComps +
+                  Math.min(
+                    this.glyphs[idx].ligatureComponent || 1,
+                    lastNumComps,
+                  );
+                this.glyphs[idx].ligatureID = ligatureGlyph.ligatureID;
+                this.glyphs[idx].ligatureComponent = ligatureComponent;
+                idx++;
+              }
+            }
+
+            lastLigID = this.glyphs[idx].ligatureID;
+            lastNumComps = this.glyphs[idx].codePoints.length;
+            curComps += lastNumComps;
+            idx++; // skip base glyph
+          }
+
+          // Adjust ligature components for any marks following
+          if (lastLigID && !isMarkLigature) {
+            for (let i = idx; i < this.glyphs.length; i++) {
+              if (this.glyphs[i].ligatureID === lastLigID) {
+                var ligatureComponent =
+                  curComps -
+                  lastNumComps +
+                  Math.min(this.glyphs[i].ligatureComponent || 1, lastNumComps);
+                this.glyphs[i].ligatureComponent = ligatureComponent;
+              } else {
+                break;
+              }
+            }
+          }
+
+          // Delete the matched glyphs, and replace the current glyph with the ligature glyph
+          for (let i = matched.length - 1; i >= 0; i--) {
+            this.glyphs.splice(matched[i], 1);
+          }
+
+          this.glyphs[this.glyphIterator.index] = ligatureGlyph;
+          return true;
+        }
+
+        return false;
+      }
+
+      case 5: // Contextual Substitution
+        return this.applyContext(table);
+
+      case 6: // Chaining Contextual Substitution
+        return this.applyChainingContext(table);
+
+      case 7: // Extension Substitution
+        return this.applyLookup(table.lookupType, table.extension);
+
+      case 8: {
+        // Reverse Chaining Contextual Single Substitution
+        let index = this.coverageIndex(table.coverage);
+        if (index === -1) {
+          return false;
+        }
+
+        // Backtrack/lookahead contexts are checked against the current
+        // glyph in the buffer. The iteration order in applyLookups is
+        // reversed for Type 8 so lookahead always sees post-substitution
+        // glyphs (per OpenType spec) and backtrack sees pre-substitution.
+        if (
+          this.coverageSequenceMatches(
+            -table.backtrackGlyphCount,
+            table.backtrackCoverage,
+          ) &&
+          this.coverageSequenceMatches(1, table.lookaheadCoverage)
+        ) {
+          this.glyphIterator.cur.id = table.substitute.get(index);
+          return true;
+        }
+
+        return false;
+      }
+
+      default:
+        throw new Error(`GSUB lookupType ${lookupType} is not supported`);
+    }
+  }
+}
