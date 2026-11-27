@@ -291,6 +291,25 @@ export default class TTFGlyph extends Glyph {
         glyph.components[i].dy = point.y;
       }
     }
+
+    // The metrics come from the varied phantom points, so a glyph whose
+    // outline is read before its metrics still reports the metrics of its
+    // variation. Reading the path used to be what updated them, which made
+    // the two orders disagree.
+    this._updateVariationMetrics(glyph);
+  }
+
+  _updateVariationMetrics(glyph) {
+    if (!glyph.phantomPoints || this._font.directory.tables.HVAR) {
+      return;
+    }
+
+    let { phantomPoints } = glyph;
+    let metrics = this._metrics;
+    metrics.advanceWidth = phantomPoints[1].x - phantomPoints[0].x;
+    metrics.advanceHeight = phantomPoints[2].y - phantomPoints[3].y;
+    metrics.leftBearing = glyph.xMin - phantomPoints[0].x;
+    metrics.topBearing = phantomPoints[2].y - glyph.yMax;
   }
 
   _getPhantomPoints(glyph) {
@@ -349,15 +368,9 @@ export default class TTFGlyph extends Glyph {
       points = glyph.points || [];
     }
 
-    // Recompute and cache metrics if we performed variation processing, and don't have an HVAR table
-    if (glyph.phantomPoints && !this._font.directory.tables.HVAR) {
-      this._metrics.advanceWidth =
-        glyph.phantomPoints[1].x - glyph.phantomPoints[0].x;
-      this._metrics.advanceHeight =
-        glyph.phantomPoints[2].y - glyph.phantomPoints[3].y;
-      this._metrics.leftBearing = glyph.xMin - glyph.phantomPoints[0].x;
-      this._metrics.topBearing = glyph.phantomPoints[2].y - glyph.yMax;
-    }
+    // The metrics follow the varied phantom points, whether the path or the
+    // metrics are read first.
+    this._updateVariationMetrics(glyph);
 
     let contours = [];
     let cur = [];

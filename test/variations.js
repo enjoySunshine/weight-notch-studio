@@ -196,6 +196,127 @@ describe('variations', function () {
       assert.equal(glyph.advanceWidth, 586);
       assert.equal(glyph.advanceHeight, 990);
     });
+
+    describe('the notches of the Ç', function () {
+      // The sign has one Ç. Its default notch starts at 328,-12 and advances
+      // 562; the heaviest starts at 354,-12 and advances 586. The glyph is not
+      // the default one stretched sideways: that would start at 328 * 586/562
+      // = 342, not at 354.
+      let open = () =>
+        fontkit.openSync(
+          new URL('data/PhantomTest/PhantomTest-VF.ttf', import.meta.url),
+        );
+      let read = (font) => {
+        let glyph = font.glyphForCodePoint(0xc7);
+        let [x, y] = glyph.path.commands[0].args;
+        return { x, y, advance: glyph.advanceWidth };
+      };
+
+      it('starts the default notch at 328,-12 with advance 562', function () {
+        assert.deepEqual(read(open()), { x: 328, y: -12, advance: 562 });
+      });
+
+      it('starts the heaviest notch at 354,-12 with advance 586', function () {
+        assert.deepEqual(read(open().getVariation({ wght: 900 })), {
+          x: 354,
+          y: -12,
+          advance: 586,
+        });
+      });
+
+      it('is not the default notch scaled by 586/562', function () {
+        let thin = read(open());
+        let heavy = read(open().getVariation({ wght: 900 }));
+
+        // Scaling the default notch would put its start at 342, twelve units
+        // short of where the font puts it.
+        assert.equal(Math.round((thin.x * heavy.advance) / thin.advance), 342);
+        assert.notEqual(heavy.x, 342);
+        assert.equal(heavy.x, 354);
+
+        // The two notches do not move the same way horizontally and vertically.
+        assert.equal(heavy.advance - thin.advance, 24);
+        assert.equal(heavy.x - thin.x, 26);
+        assert.equal(heavy.y, thin.y);
+      });
+
+      it('places the middle notch by the font’s variation, not a straight line', function () {
+        // Evenly splitting 328..354 and 562..586 at wght 400 gives 335 and 569,
+        // but the avar table bends the axis, and the font puts it at 338/571.
+        assert.deepEqual(read(open().getVariation({ wght: 400 })), {
+          x: 338,
+          y: -12,
+          advance: 571,
+        });
+      });
+
+      it('moves the outline points and the path together', function () {
+        for (let settings of [undefined, { wght: 400 }, { wght: 900 }]) {
+          let font = open();
+          let glyph = (
+            settings ? font.getVariation(settings) : font
+          ).glyphForCodePoint(0xc7);
+          let [first] = glyph._getContours()[0];
+          let [x, y] = glyph.path.commands[0].args;
+
+          assert.deepEqual([first.x, first.y], [x, y]);
+        }
+      });
+
+      it('reads the same numbers whichever the glyph is read for first', function () {
+        // Whether the outline is measured when the glyph is read or when its
+        // path is drawn, both must give the heaviest notch's numbers.
+        for (let wght of [400, 900]) {
+          let font = open();
+          let expected = read(font.getVariation({ wght }));
+          for (let readFirst of [
+            (g) => g.path,
+            (g) => g._getContours(),
+            (g) => g._decode(),
+            (g) => g.bbox,
+          ]) {
+            let glyph = font.getVariation({ wght }).glyphForCodePoint(0xc7);
+            readFirst(glyph);
+
+            // The advance first: reading the path is what used to make it
+            // right, so a glyph decoded before its metrics must still be.
+            assert.equal(
+              glyph.advanceWidth,
+              expected.advance,
+              `wght ${wght} advance after ${readFirst}`,
+            );
+
+            let [x, y] = glyph.path.commands[0].args;
+            assert.deepEqual(
+              { x, y, advance: glyph.advanceWidth },
+              expected,
+              `wght ${wght} path after ${readFirst}`,
+            );
+          }
+        }
+      });
+
+      it('draws two different paths for the two notches', function () {
+        let font = open();
+        let thin = font.glyphForCodePoint(0xc7).path.toSVG();
+        let heavy = font
+          .getVariation({ wght: 900 })
+          .glyphForCodePoint(0xc7)
+          .path.toSVG();
+
+        assert.notEqual(thin, heavy);
+        assert.ok(thin.startsWith('M328 -12Q'));
+        assert.ok(heavy.startsWith('M354 -12Q'));
+      });
+
+      it('leaves the default notch as it was after visiting the heaviest', function () {
+        let font = open();
+        let before = read(font);
+        font.getVariation({ wght: 900 }).glyphForCodePoint(0xc7).path;
+        font.getVariation({ wght: 400 }).glyphForCodePoint(0xc7).path;
+        assert.deepEqual(read(font), before);
+      });
+    });
   });
 
   describe('CFF2 variations', function () {

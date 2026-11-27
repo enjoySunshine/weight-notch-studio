@@ -13,3 +13,5 @@ dist
 .env
 .env.*
 preview/out.svg
+preview/out-*.svg
+preview/out.html
